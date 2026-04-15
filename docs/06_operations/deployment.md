@@ -6,129 +6,103 @@
 
 ```mermaid
 flowchart LR
-    subgraph 開発者
-        DEV[ローカル開発]
-    end
-
-    subgraph GitHub
-        PR[Pull Request]
-        MAIN[main ブランチ]
-    end
-
-    subgraph GitHub Actions
-        CI[CI: テスト・Lint]
-        PLAN[terraform plan]
-        APPLY[terraform apply]
-        DEPLOY[Lambda/ECS デプロイ]
-    end
-
-    subgraph AWS
-        DEV_ENV[dev 環境]
-        PROD_ENV[prod 環境]
-    end
-
-    DEV --> PR
-    PR --> CI
-    CI -- テスト通過 --> PLAN
-    PLAN -- レビュー承認 --> MAIN
-    MAIN --> APPLY --> DEV_ENV
-    MAIN -- タグ push v*.*.* --> DEPLOY --> PROD_ENV
+    PC[研修生PC] -->|SSH| MGT[管理EC2]
+    MGT -->|git pull| REPO[GitHub]
+    MGT -->|terraform plan| PLAN[変更内容確認]
+    PLAN -->|問題なければ| APPLY[terraform apply]
+    APPLY --> AWS[AWSリソース作成・更新]
 ```
 
-### 本番デプロイの条件
-
-1. `main` ブランチへのマージ → dev 環境に自動デプロイ
-2. `v1.2.3` 形式のタグ push → prod 環境にデプロイ（手動承認付き）
-3. `terraform apply` は必ず `plan` のレビュー後
-
----
-
-## Lambda デプロイ戦略
-
-Lambda の更新は**エイリアス + ウェイトルーティング**でカナリアリリースを行う。
-
-```
-本番トラフィック:
-  alias: production
-    v1 (stable): 90%
-    v2 (new):    10%  ← 新バージョンをまず 10% に流す
-
-問題なければ:
-  v2 を 100% に切り替え → v1 を削除
-```
-
-> **ロールバック:** エイリアスのウェイトを変えるだけなので 30 秒以内に完了。
-
----
-
-## Terraform 管理方針
-
-| 項目 | 設定 |
-|---|---|
-| state バックエンド | S3 + DynamoDB ロック |
-| state ファイルの分割 | 環境（dev/prod）× レイヤー（network/app/data）で分割 |
-| モジュール | `modules/` に共通コンポーネントを切り出す |
-| バージョン固定 | `required_version = "~> 1.8"` を必ず書く |
-
-```
-state ファイルの構成:
-  s3://order-tfstate/
-    dev/
-      network/terraform.tfstate
-      app/terraform.tfstate
-      data/terraform.tfstate
-    prod/
-      network/terraform.tfstate
-      app/terraform.tfstate
-      data/terraform.tfstate
-```
-
-> **network と app を分ける理由:** VPC の変更は稀で影響が大きい。  
-> Lambda の更新は頻繁。分けることで apply のスコープを最小化する。
-
----
-
-## インシデント対応フロー
-
-```mermaid
-flowchart TD
-    ALERT[CloudWatch Alarm 発火]
-    --> NOTIFY[SNS → Slack #ops-alert]
-    --> CHECK{重大度判断}
-    
-    CHECK -- P1 注文が止まっている --> P1[即時対応\n担当者に電話]
-    CHECK -- P2 エラー率上昇 --> P2[30分以内に調査開始]
-    CHECK -- P3 パフォーマンス低下 --> P3[翌営業日対応]
-
-    P1 --> ROLLBACK[Lambdaエイリアスを前バージョンに戻す]
-    ROLLBACK --> POSTMORTEM[ポストモーテム作成]
-```
-
-### よく使う調査コマンド
+### 手順
 
 ```bash
-# Lambda のエラーログを直近 1 時間で検索
+# 1. 管理EC2 に SSH
+ssh -i ~/.ssh/shop-training.pem ec2-user@<管理EC2のパブリックIP>
+
+# 2. 最新コードを取得
+cd ~/aws-infra
+git pull origin main
+
+# 3. 変更内容を確認（必ず apply 前に実行）
+cd terraform/environments/dev
+terraform plan
+
+# 4. 適用
+terraform apply
+
+# 5. 研修終了時：リソース削除
+terraform destroy
+```
+
+> **`terraform plan` は必ず実行すること。**
+> apply 前に何が変わるかを確認する習慣をつける。
+> 意図しないリソースの削除・変更が含まれていないかチェックする。
+
+---
+
+## Terraform 状態管理（state）
+
+Terraform は作成したリソースの状態を `terraform.tfstate` に記録する。  
+複数人で作業する場合、state をローカルに置くと競合するため S3 で共有する。
+
+```hcl
+# terraform/environments/dev/backend.tf
+
+terraform {
+  backend "s3" {
+    bucket         = "shop-tfstate-<account_id>"
+    key            = "dev/terraform.tfstate"
+    region         = "ap-northeast-1"
+    dynamodb_table = "shop-tfstate-lock"  # 同時実行を防ぐロック
+  }
+}
+```
+
+> **state ファイルは直接編集しない。**
+> 壊れると Terraform がリソースを管理できなくなる。
+
+---
+
+## インシデント対応
+
+### よく使う確認コマンド
+
+```bash
+# EC2 インスタンスの状態確認
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=shop-app-*" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name]'
+
+# ALB のターゲットヘルスチェック確認
+aws elbv2 describe-target-health \
+  --target-group-arn <ターゲットグループARN>
+
+# RDS の状態確認
+aws rds describe-db-instances \
+  --db-instance-identifier shop-db
+
+# CloudWatch Logs でアプリエラーを確認
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/order-create \
-  --start-time $(date -d '1 hour ago' +%s000) \
+  --log-group-name /shop/app \
   --filter-pattern "ERROR"
+```
 
-# SQS DLQ のメッセージ数確認
-aws sqs get-queue-attributes \
-  --queue-url https://sqs.ap-northeast-1.amazonaws.com/<ACCOUNT>/order-queue-dlq \
-  --attribute-names ApproximateNumberOfMessages
+### ロールバック手順
 
-# Lambda の現在のエイリアス確認
-aws lambda get-alias \
-  --function-name order-create \
-  --name production
+Terraform で前のバージョンに戻す場合は、コードを git で戻してから再 apply する。
+
+```bash
+# 1つ前のコミットに戻す例
+git revert HEAD
+terraform plan   # 変更内容を確認
+terraform apply
 ```
 
 ---
 
-## 設計上の禁止事項（AI 参照用）
+## 設計上の禁止事項
 
-- 本番への直接デプロイ禁止（必ず dev → prod の順）
-- `terraform apply -auto-approve` を本番で実行禁止
-- Lambda のバージョン管理なしでのデプロイ禁止（ロールバックできなくなる）
-- `aws configure` でアクセスキーを設定しない（IAM ロール / SSO を使う）
+- `terraform apply` を `plan` 確認なしで実行しない
+- state ファイルを直接編集しない
+- 管理EC2 で root ユーザーとして terraform を実行しない（ec2-user を使う）
+- 研修終了後に `terraform destroy` を忘れない

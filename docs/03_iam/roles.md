@@ -8,110 +8,75 @@
 
 | ロール名 | アタッチ先 | 目的 |
 |---|---|---|
-| order-lambda-create-role | Lambda: order-create | 注文作成 Lambda の実行権限 |
-| order-lambda-process-role | Lambda: order-process | 注文処理 Lambda の実行権限 |
-| order-ecs-task-role | ECS タスク | 管理 API コンテナの実行権限 |
-| order-ecs-execution-role | ECS タスク実行 | ECR pull・ログ送信（ECS が使う） |
-| order-deploy-role | CI/CD（GitHub Actions） | デプロイ用。AssumeRole で一時的に使う |
-
-> **`order-ecs-task-role` と `order-ecs-execution-role` の違い**  
-> - `execution-role`: ECS がコンテナを**起動するために**使うロール（ECR pull, CW Logs push）  
-> - `task-role`: コンテナ内のアプリが**AWS API を呼ぶために**使うロール  
-> 研修でよく混同される。2つは別物。
+| shop-app-role | EC2 App Server | アプリが AWS サービスを呼ぶための権限 |
+| shop-mgt-role | 管理EC2 | Terraform を実行するための権限 |
 
 ---
 
 ## ロール詳細
 
-### order-lambda-create-role
+### shop-app-role（EC2 App Server 用）
+
+アプリケーションが実行中に必要とする権限のみを付与する。
 
 ```
 許可するアクション:
-  SQS:
-    - sqs:SendMessage
-    リソース: arn:aws:sqs:ap-northeast-1:*:order-queue
 
-  Secrets Manager:
-    - secretsmanager:GetSecretValue
-    リソース: arn:aws:secretsmanager:ap-northeast-1:*:secret:order/*
-
-  SSM:
+  SSM Parameter Store（シークレット取得）:
     - ssm:GetParameter
-    リソース: arn:aws:ssm:ap-northeast-1:*:parameter/order/*
+    - ssm:GetParameters
+    リソース: arn:aws:ssm:ap-northeast-1:*:parameter/shop/*
 
-  DynamoDB（冪等性テーブル）:
-    - dynamodb:GetItem
-    - dynamodb:PutItem
-    リソース: arn:aws:dynamodb:ap-northeast-1:*:table/order-idempotency
+  S3（静的ファイル・ログ）:
+    - s3:GetObject
+    リソース: arn:aws:s3:::shop-static-*/assets/*
 
-  CloudWatch Logs（Lambda 基本実行）:
+  CloudWatch Logs（アプリログ送信）:
     - logs:CreateLogGroup
     - logs:CreateLogStream
     - logs:PutLogEvents
-    リソース: arn:aws:logs:ap-northeast-1:*:log-group:/aws/lambda/order-create:*
-
-  X-Ray:
-    - xray:PutTraceSegments
-    - xray:PutTelemetryRecords
-    リソース: "*"
+    リソース: arn:aws:logs:ap-northeast-1:*:log-group:/shop/app:*
 ```
 
-> **設計判断:** `sqs:SendMessage` のリソースはキュー ARN を直指定（`*` は使わない）。  
-> 誤送信を防ぐために対象キューを明示する。
+### shop-mgt-role（管理EC2 用）
 
-### order-lambda-process-role
-
-```
-許可するアクション（order-create-role との差分）:
-  SQS（追加）:
-    - sqs:ReceiveMessage
-    - sqs:DeleteMessage
-    - sqs:ChangeMessageVisibility
-    リソース: arn:aws:sqs:ap-northeast-1:*:order-queue
-
-  S3:
-    - s3:PutObject
-    リソース: arn:aws:s3:::order-receipts-*/receipts/*
-    ※ バケット全体へのアクセスは与えない（プレフィックス制限）
-```
-
-### order-deploy-role（CI/CD 用）
-
-GitHub Actions OIDC を使って一時クレデンシャルを取得する。  
-**長期アクセスキーを GitHub Secrets に保存しない。**
+Terraform が AWS リソースを作成・変更・削除するための権限。  
+研修用途のため広めの権限を付与するが、本番運用では絞ること。
 
 ```
-信頼ポリシー:
-  Principal: { Federated: "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com" }
-  Condition:
-    StringEquals:
-      token.actions.githubusercontent.com:aud: sts.amazonaws.com
-      token.actions.githubusercontent.com:sub: repo:<org>/<repo>:ref:refs/heads/main
-    ← main ブランチからのデプロイのみ許可
-
 許可するアクション:
-  Lambda: UpdateFunctionCode, UpdateFunctionConfiguration
-  ECR: GetAuthorizationToken, BatchCheckLayerAvailability, PutImage ...
-  S3（Terraform state）: GetObject, PutObject, DeleteObject
-  DynamoDB（Terraform lock）: GetItem, PutItem, DeleteItem
+  EC2: *（インスタンス・SG・VPC・サブネット・ALB の操作）
+  RDS: *（クラスター・インスタンス・サブネットグループの操作）
+  IAM: PassRole（shop-app-role のみ）
+  SSM: *（パラメータの作成・取得・削除）
+  S3: *（Terraform state バケットの操作）
+  DynamoDB: *（Terraform state ロックテーブルの操作）
+  CloudWatch: *（ロググループ・アラームの操作）
+  AutoScaling: *
+  ElasticLoadBalancing: *
+
+  ※ 本番環境では操作対象リソースを ARN で絞ること
 ```
+
+> **IAM PassRole について:** Terraform が EC2 を起動する際に `shop-app-role` を  
+> インスタンスプロファイルとして渡す必要がある。`iam:PassRole` はその許可。  
+> `"Resource": "*"` にすると任意のロールを渡せてしまうため、対象ロールの ARN を指定する。
 
 ---
 
-## IAM ポリシー設計の判断フロー
+## インスタンスプロファイルとロールの関係
 
-```mermaid
-flowchart TD
-    A[新しい権限が必要] --> B{AWS 管理ポリシーで\n対応できるか？}
-    B -- YES --> C[管理ポリシーを確認\nスコープが広すぎないか？]
-    C -- 広すぎる --> D[カスタムポリシーを作成]
-    C -- OK --> E[管理ポリシーをアタッチ]
-    B -- NO --> D
-    D --> F[アクション: 必要なものだけ列挙]
-    F --> G[リソース: ARN を直指定\nワイルドカードは最後の手段]
-    G --> H[Condition: 必要なら IP・タグ制限を追加]
-    H --> I[最小権限レビュー\nIAM Access Analyzer で確認]
+EC2 に IAM ロールを付与するには、ロールを**インスタンスプロファイル**でラップする必要がある。
+
 ```
+IAM ロール（shop-app-role）
+    ↓ ラップ
+インスタンスプロファイル（shop-app-profile）
+    ↓ アタッチ
+EC2 インスタンス
+```
+
+Terraform では `aws_iam_instance_profile` リソースで作成する。
 
 ---
 
@@ -119,17 +84,15 @@ flowchart TD
 
 | 間違い | 正しい設計 |
 |---|---|
-| `"Resource": "*"` を全アクションに使う | リソース ARN を直指定する |
-| AdministratorAccess を Lambda に付与 | 必要なアクションのみのカスタムポリシー |
-| CI/CD にアクセスキーを発行 | OIDC で一時クレデンシャルを取得 |
-| task-role と execution-role を同じにする | 役割が違うので分ける |
-| `iam:*` を含むポリシーを許可 | IAM 操作は別の管理ロールに分離 |
+| EC2 に AdministratorAccess を付ける | 必要なアクションのみのカスタムポリシー |
+| DB パスワードを環境変数に直書き | SSM Parameter Store から取得 |
+| IAM ロールなしで EC2 を起動し、アクセスキーをコードに書く | インスタンスプロファイルを使う |
+| `iam:PassRole` に `"Resource": "*"` を指定 | 渡すロールの ARN を指定 |
 
 ---
 
-## 設計上の禁止事項（AI 参照用）
+## 設計上の禁止事項
 
-- `"Resource": "*"` は X-Ray・CloudWatch Logs 以外で使用禁止
-- AdministratorAccess ポリシーはどのロールにもアタッチしない
-- IAM ユーザーへのアクセスキー発行禁止（人間のアクセスは SSO / ロールスイッチ）
-- `iam:PassRole` を広く許可しない（特定ロールの ARN に制限する）
+- EC2 に AdministratorAccess ポリシーをアタッチしない
+- アクセスキー・シークレットキーをコードやファイルに書かない（インスタンスプロファイルを使う）
+- `iam:PassRole` のリソースに `*` を使わない
