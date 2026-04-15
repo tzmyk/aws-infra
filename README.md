@@ -20,7 +20,7 @@ docs/         設計書（期待値の定義）
   01_network/   VPC・サブネット・ルーティング・セキュリティグループ
   02_security/  セキュリティ設計・暗号化・証跡
   03_iam/       IAMロール・ポリシー・最小権限設計
-  04_compute/   Lambda・ECS・EC2などコンピューティング設計
+  04_compute/   EC2・Auto Scaling・RDS のコンピューティング設計
   05_cost/      コスト見積もり・最適化方針
   06_operations/ デプロイ・監視・インシデント対応
 

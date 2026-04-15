@@ -21,7 +21,7 @@ ssh -i ~/.ssh/shop-training.pem ec2-user@<管理EC2のパブリックIP>
 
 # 2. 最新コードを取得
 cd ~/aws-infra
-git pull origin main
+git pull origin master
 
 # 3. 変更内容を確認（必ず apply 前に実行）
 cd terraform/environments/dev

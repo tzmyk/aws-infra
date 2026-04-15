@@ -21,7 +21,8 @@ aws-infra/
 │   │   ├── network/
 │   │   ├── security_groups/
 │   │   ├── iam/
-│   │   └── lambda/
+│   │   ├── ec2/
+│   │   └── rds/
 │   └── environments/          環境別エントリーポイント
 │       ├── dev/
 │       └── prod/
@@ -73,7 +74,7 @@ modules/<name>/
   - `docs/01_network/` → `terraform/modules/network/`
   - `docs/03_iam/` → `terraform/modules/iam/`
 - `environments/` は `dev` と `prod` の2環境を基本とする
-- シークレットは `.tfvars` に書かない（Secrets Manager / SSM 参照）
+- シークレットは `.tfvars` に書かない（SSM Parameter Store 参照）
 
 ### tests/infra/
 
